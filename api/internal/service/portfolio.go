@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 
 	"keyrail.local/wallet-portfolio/internal/cache"
@@ -13,7 +14,7 @@ import (
 )
 
 var (
-	ErrInvalidAddress       = errors.New("invalid wallet address")
+	ErrInvalidAddress      = errors.New("invalid wallet address")
 	ErrProviderUnavailable = errors.New("provider unavailable")
 )
 
@@ -47,32 +48,63 @@ func (s *PortfolioService) Summary(ctx context.Context, address string) (models.
 		return models.PortfolioResponse{}, fmt.Errorf("load balances: %w", err)
 	}
 
-	response := models.PortfolioResponse{Address: address, Tokens: make([]models.TokenHolding, 0, len(balances))}
-	for _, balance := range balances {
-		holding := models.TokenHolding{
+	response := models.PortfolioResponse{Address: address, Tokens: make([]models.TokenHolding, len(balances))}
+	for i, balance := range balances {
+		response.Tokens[i] = models.TokenHolding{
 			Symbol: balance.Symbol,
 			Name:   balance.Name,
 			Chain:  balance.Chain,
 			Amount: balance.Amount,
 		}
+	}
 
-		cacheKey := strings.ToUpper(balance.Symbol)
-		price, ok := s.cache.Get(cacheKey)
-		if !ok {
-			price, err = s.provider.TokenPriceUSD(context.Background(), balance.Symbol)
-			if err == nil {
-				s.cache.Set(cacheKey, price)
+	type priceJob struct {
+		index   int
+		balance models.TokenBalance
+	}
+
+	jobs := make(chan priceJob)
+	workerCount := min(s.maxPriceLookups, len(balances))
+	var wg sync.WaitGroup
+	wg.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				balance := job.balance
+				holding := &response.Tokens[job.index]
+
+				cacheKey := strings.ToUpper(balance.Symbol)
+				price, ok := s.cache.Get(cacheKey)
+				if !ok {
+					priceCtx, cancel := context.WithTimeout(ctx, s.priceTimeout)
+					var priceErr error
+					price, priceErr = s.provider.TokenPriceUSD(priceCtx, balance.Symbol)
+					cancel()
+					if priceErr != nil {
+						continue
+					}
+					s.cache.Set(cacheKey, price)
+				}
+
+				value := balance.Amount * price
+				holding.PriceUSD = &price
+				holding.ValueUSD = &value
+				holding.PriceAvailable = true
 			}
-		}
+		}()
+	}
 
-		if err == nil {
-			value := balance.Amount * price
-			holding.PriceUSD = &price
-			holding.ValueUSD = &value
-			holding.PriceAvailable = true
-			response.TotalUSD += value
+	for i, balance := range balances {
+		jobs <- priceJob{index: i, balance: balance}
+	}
+	close(jobs)
+	wg.Wait()
+
+	for _, holding := range response.Tokens {
+		if holding.ValueUSD != nil {
+			response.TotalUSD += *holding.ValueUSD
 		}
-		response.Tokens = append(response.Tokens, holding)
 	}
 
 	return response, nil
